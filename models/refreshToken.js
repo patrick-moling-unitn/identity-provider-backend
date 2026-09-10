@@ -8,7 +8,11 @@ module.exports = mongoose.model('RefreshToken', new Schema({
         ref: 'AuthenticatedUser',
         index: true
     },
-    tokenHash: String,
+    tokenHash: {
+        type: String,
+        unique: true,
+        index: true
+    },
     rotated: {
         type: Boolean,
         default: false

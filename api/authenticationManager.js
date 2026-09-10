@@ -4,6 +4,7 @@ const router = express.Router();
 
 const AuthenticatedUser = require('../models/authenticatedUser');
 const RefreshToken = require('../models/refreshToken.js');
+const Code = require('../models/code.js');
 const error = require('../enums/errorCodes.cjs.js');
 
 const bcrypt = require('bcrypt');
@@ -13,17 +14,26 @@ const jwt = require('jsonwebtoken');
 const JWT_TOKEN_DURATION = 10 * 60; //10 minutes
 const SESSION_DURATION = 7 * 24 * 60 * 60; //7 days
 
+const CODE_DURATION = 30; //30 seconds
+
 const MIN_USER_PASSWORD_LENGTH = Number(process.env.MIN_PASSWORD_LENGTH);
 const SALT_ROUNDS = Number(process.env.HASHING_SALT_ROUNDS);
 
 const LOG_MODE = 1; //0: NONE; 1: MINIMAL; 2: MEDIUM; 3: HIGH
 
+const ALLOWED_AUTH_DOMAINS = JSON.parse(process.env.ALLOWED_AUTH_DOMAINS || '[]');
+ALLOWED_AUTH_DOMAINS.forEach(domain => { 
+    if (domain.endsWith('/')) ALLOWED_AUTH_DOMAINS[index] = domain.slice(0, -1);
+});
+
 const API_V = process.env.API_VERSION;
+
+const ALLOW_ALL_DOMAINS = ALLOWED_AUTH_DOMAINS.includes("*");
 
 const REFRESH_TOKEN_HTTP_SETTINGS = {
     httpOnly: true,
     secure: false,
-    sameSite: 'strict'
+    sameSite: 'lax'
 }
 const REFRESH_TOKEN_COOKIE_SETTINGS = {
     ...REFRESH_TOKEN_HTTP_SETTINGS,
@@ -48,10 +58,10 @@ function generateAuthToken(user){
     return jwt.sign(payload, process.env.JWT_SECRET, options);
 }
 
-function generateRefreshToken(){
-    const refreshToken = crypto.randomBytes(32).toString("base64url");
-    const tokenHash = crypto.createHash("sha256").update(refreshToken).digest("hex");
-    return { refreshToken, tokenHash };
+function generateCode(){
+    const code = crypto.randomBytes(32).toString("base64url");
+    const codeHash = crypto.createHash("sha256").update(code).digest("hex");
+    return { code, codeHash };
 }
 
 /**
@@ -146,6 +156,18 @@ router.get("/", async (req, res) => {
         return res.status(400).json({ error: error("MISSING_QUERY_PARAMETER")} );
 });
 
+router.get("/callback", async (req, res) => {
+    let { redirectUrl, code, state } = req.query;
+    if (!redirectUrl || !code || !state) 
+        return res.status(400).json({ error: error("MISSING_QUERY_PARAMETER")} );
+
+    if (redirectUrl.endsWith("/")) 
+        redirectUrl = redirectUrl.slice(0, -1);
+    if (!ALLOW_ALL_DOMAINS && !ALLOWED_AUTH_DOMAINS.includes(redirectUrl))
+        return res.status(401).json({ error: error("DOMAIN_NOT_ALLOWED") })
+    res.redirect(`${redirectUrl}/callback?code=${encodeURIComponent(code)}`);
+});
+
 /**
  * RELATIVE PATH)
  *  .../authenticatedUsers/USER_IDENTIFIER
@@ -178,10 +200,12 @@ router.put("/", async (req, res, next) => {
                     console.error(err);
                     return res.status(400).json({ error: error("ID_NOT_FOUND") })
                 }
-                console.log(authenticatedUser);
+                if (LOG_MODE >= 2) console.log(authenticatedUser);
                 if (!authenticatedUser) continue;
-                if(req.body.banned !== undefined)
+                if(req.body.banned !== undefined){
                     authenticatedUser.banned = req.body.banned;
+                    if (req.body.banned) await RefreshToken.deleteMany({userId: authenticatedUser.id});
+                }
                 if(req.body.role !== undefined){
                     if (req.body.role !== 'SuperAdmin')
                         authenticatedUser.role = req.body.role;
@@ -285,23 +309,58 @@ router.post("/",  async (req, res) => {
                 }
             }
             
-            const { refreshToken, tokenHash } = generateRefreshToken();
-            tokenEntry = new RefreshToken({
-                userId: authenticatedUser.id,
-                tokenHash,
-                expireDate: new Date(Date.now() + SESSION_DURATION * 1000)
-            });
+            const { code, codeHash } = generateCode();
             try{
-                await tokenEntry.save();
+                await Code.create({
+                    userId: authenticatedUser.id,
+                    codeHash,
+                    expireDate: new Date(Date.now() + CODE_DURATION * 1000)
+                });
             }catch(err){
                 return res.status(500).json({ err });
             }
-            res.cookie('refreshToken', refreshToken, REFRESH_TOKEN_COOKIE_SETTINGS);
-            res.status(200).json({ authToken: generateAuthToken(authenticatedUser) });
+            res.status(200).json({ code });
         }
         else
             res.status(400).json({ error: error("WRONG_PASSWORD") })
     });
+});
+
+router.post("/authorize", async (req, res) => {
+    const reqCode = req.body.code;
+    if (!reqCode) return res.status(400).json({ error: error("MISSING_TOKEN") })
+        
+    const codeHash = crypto.createHash("sha256").update(reqCode).digest("hex");
+    let codeEntry;
+    try{
+        codeEntry = await Code.findOneAndDelete({codeHash, expireDate: { $gt: new Date() }});
+    }catch(err){
+        return res.status(500).json({ err });
+    }
+
+    if (codeEntry){
+        let authenticatedUser;
+        try {
+            authenticatedUser = await AuthenticatedUser.findOne({_id: codeEntry.userId});
+        }catch {
+            return res.status(400).json({ error: error("WRONG_DATA") })
+        }
+        if(!authenticatedUser)
+            return res.status(400).json({ error: error("NO_MATCHING_AUTHENTICATED_USER_ID") })
+
+        const { code, codeHash } = generateCode();
+        try{
+            await RefreshToken.create({
+                userId: authenticatedUser.id,
+                tokenHash: codeHash,
+                expireDate: new Date(Date.now() + SESSION_DURATION * 1000)
+            });
+        }catch(err){
+            return res.status(500).json({ err });
+        }
+        res.status(200).json({ authToken: generateAuthToken(authenticatedUser), refreshToken: code });
+    }else 
+        return res.status(401).json({ error: error("INVALID_TOKEN") });
 });
 
 router.post("/refresh", cookieParser(), async (req, res) => {
@@ -312,7 +371,7 @@ router.post("/refresh", cookieParser(), async (req, res) => {
     const tokenHash = crypto.createHash("sha256").update(refreshToken).digest("hex");
     let tokenEntry;
     try{
-        tokenEntry = await RefreshToken.findOne({tokenHash: tokenHash});
+        tokenEntry = await RefreshToken.findOne({tokenHash});
     }catch(err){
         return res.status(500).json({ err });
     }
@@ -334,7 +393,7 @@ router.post("/refresh", cookieParser(), async (req, res) => {
         if(!authenticatedUser)
             return res.status(400).json({ error: error("NO_MATCHING_AUTHENTICATED_USER_ID") })
 
-        const { refreshToken, tokenHash } = generateRefreshToken(),
+        const { code, codeHash } = generateCode(),
               expireDate = tokenEntry.expireDate;
         tokenEntry.expireDate = currentDate;
         tokenEntry.rotated = true;
@@ -342,14 +401,13 @@ router.post("/refresh", cookieParser(), async (req, res) => {
             await tokenEntry.save();
             await RefreshToken.create({ 
                 userId: tokenEntry.userId, 
-                tokenHash,
+                tokenHash: codeHash,
                 expireDate
             });
         }catch(err){
             return res.status(500).json({ err });
         }
-        res.cookie('refreshToken', refreshToken, REFRESH_TOKEN_COOKIE_SETTINGS);
-        res.status(200).json({ authToken: generateAuthToken(authenticatedUser) });
+        res.status(200).json({ authToken: generateAuthToken(authenticatedUser), refreshToken: code });
     }else 
         return res.status(401).json({ error: error("INVALID_TOKEN") });
 });
@@ -363,7 +421,7 @@ router.delete("/refresh", cookieParser(), async (req, res, next) => {
         const tokenHash = crypto.createHash("sha256").update(refreshToken).digest("hex");
         let tokenEntry;
         try{
-            tokenEntry = await RefreshToken.findOne({tokenHash: tokenHash});
+            tokenEntry = await RefreshToken.findOne({tokenHash});
         }catch(err){
             return res.status(500).json({ err });
         }
@@ -396,7 +454,7 @@ router.delete("/refresh", cookieParser(), async (req, res) => {
         const tokenHash = crypto.createHash("sha256").update(refreshToken).digest("hex");
         let tokenEntry;
         try{
-            tokenEntry = await RefreshToken.findOne({tokenHash: tokenHash});
+            tokenEntry = await RefreshToken.findOne({tokenHash});
         }catch(err){
             return res.status(500).json({ err });
         }

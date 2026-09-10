@@ -10,7 +10,7 @@ const requestValidator = require('./api/requestValidator');
 const app = express()
 
 app.use(cors({
-    origin: 'http://localhost:5173',
+    origin: ['http://localhost:8020', 'http://localhost:5173'],
     credentials: true
 }));
 app.use(express.json())
