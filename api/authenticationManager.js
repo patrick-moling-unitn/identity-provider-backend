@@ -157,15 +157,19 @@ router.get("/", async (req, res) => {
 });
 
 router.get("/callback", async (req, res) => {
-    let { redirectUrl, code, state } = req.query;
-    if (!redirectUrl || !code || !state) 
+    let { redirect_uri, code, state } = req.query;
+    if (!redirect_uri || !code || !state) 
         return res.status(400).json({ error: error("MISSING_QUERY_PARAMETER")} );
 
-    if (redirectUrl.endsWith("/")) 
-        redirectUrl = redirectUrl.slice(0, -1);
-    if (!ALLOW_ALL_DOMAINS && !ALLOWED_AUTH_DOMAINS.includes(redirectUrl))
+    if (redirect_uri.endsWith("/")) 
+        redirect_uri = redirect_uri.slice(0, -1);
+    if (!ALLOW_ALL_DOMAINS && !ALLOWED_AUTH_DOMAINS.includes(redirect_uri))
         return res.status(401).json({ error: error("DOMAIN_NOT_ALLOWED") })
-    res.redirect(`${redirectUrl}/callback?code=${encodeURIComponent(code)}`);
+    res.redirect(`${redirect_uri}/callback?code=${encodeURIComponent(code)}`);
+});
+
+router.get("/verify", async (req, res) => {
+    res.status(204).send();
 });
 
 /**
@@ -358,7 +362,8 @@ router.post("/authorize", async (req, res) => {
         }catch(err){
             return res.status(500).json({ err });
         }
-        res.status(200).json({ authToken: generateAuthToken(authenticatedUser), refreshToken: code });
+        res.cookie('refreshToken', code, REFRESH_TOKEN_COOKIE_SETTINGS);
+        res.status(200).json({ authToken: generateAuthToken(authenticatedUser) });
     }else 
         return res.status(401).json({ error: error("INVALID_TOKEN") });
 });
@@ -407,7 +412,8 @@ router.post("/refresh", cookieParser(), async (req, res) => {
         }catch(err){
             return res.status(500).json({ err });
         }
-        res.status(200).json({ authToken: generateAuthToken(authenticatedUser), refreshToken: code });
+        res.cookie('refreshToken', code, REFRESH_TOKEN_COOKIE_SETTINGS);
+        res.status(200).json({ authToken: generateAuthToken(authenticatedUser) });
     }else 
         return res.status(401).json({ error: error("INVALID_TOKEN") });
 });
